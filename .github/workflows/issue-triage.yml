@@ -1,0 +1,216 @@
+name: Issue triage
+
+on:
+  issues:
+    types: [opened, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      repo_owner:
+        description: "Repository owner"
+        required: false
+        default: "pierceboggan"
+        type: string
+      repo_name:
+        description: "Repository name"
+        required: false
+        default: "triage-test"
+        type: string
+      issue_number:
+        description: "Issue number to triage"
+        required: true
+        type: number
+      apply:
+        description: "Apply labels, comment, and assignee suggestion"
+        required: false
+        default: true
+        type: boolean
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: issue-triage-${{ github.event_name == 'workflow_dispatch' && format('{0}/{1}#{2}', inputs.repo_owner, inputs.repo_name, inputs.issue_number) || format('{0}#{1}', github.repository, github.event.issue.number) }}
+  cancel-in-progress: true
+
+jobs:
+  generate:
+    name: Generate triage result
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.actor != 'github-actions[bot]' &&
+        (
+          github.event.action != 'labeled' ||
+          github.event.label.name == 'triage-needed'
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+      copilot-requests: write
+    outputs:
+      has_result: ${{ steps.validate.outputs.has_result }}
+      repo_owner: ${{ steps.context.outputs.repo_owner }}
+      repo_name: ${{ steps.context.outputs.repo_name }}
+      issue_number: ${{ steps.context.outputs.issue_number }}
+      should_apply: ${{ steps.context.outputs.should_apply }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve target issue
+        id: context
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REPO_OWNER: ${{ inputs.repo_owner }}
+          INPUT_REPO_NAME: ${{ inputs.repo_name }}
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          INPUT_APPLY: ${{ inputs.apply }}
+          EVENT_REPO_OWNER: ${{ github.repository_owner }}
+          EVENT_REPO_NAME: ${{ github.event.repository.name }}
+          EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            repo_owner="${INPUT_REPO_OWNER:-github}"
+            repo_name="${INPUT_REPO_NAME:-github-app}"
+            issue_number="${INPUT_ISSUE_NUMBER:?issue_number is required}"
+            should_apply="${INPUT_APPLY:-true}"
+          else
+            repo_owner="$EVENT_REPO_OWNER"
+            repo_name="$EVENT_REPO_NAME"
+            issue_number="$EVENT_ISSUE_NUMBER"
+            should_apply="true"
+          fi
+          echo "repo_owner=$repo_owner" >> "$GITHUB_OUTPUT"
+          echo "repo_name=$repo_name" >> "$GITHUB_OUTPUT"
+          echo "issue_number=$issue_number" >> "$GITHUB_OUTPUT"
+          echo "should_apply=$should_apply" >> "$GITHUB_OUTPUT"
+
+      - name: Prefetch issue context
+        env:
+          GH_TOKEN: ${{ secrets.TRIAGE_BOT_TOKEN || github.token }}
+          REPO_OWNER: ${{ steps.context.outputs.repo_owner }}
+          REPO_NAME: ${{ steps.context.outputs.repo_name }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/issue-triage-context
+          repo="${REPO_OWNER}/${REPO_NAME}"
+
+          gh api "repos/${repo}/issues/${ISSUE_NUMBER}" \
+            --jq '{number, title, body, state, html_url, created_at, updated_at, user: .user.login, labels: [.labels[].name], assignees: [.assignees[].login]}' \
+            > /tmp/issue-triage-context/issue.json
+
+          gh api "repos/${repo}/issues/${ISSUE_NUMBER}/comments?per_page=20" \
+            --jq '[.[] | {user: .user.login, body, created_at, updated_at}]' \
+            > /tmp/issue-triage-context/comments.json
+
+          if gh api "repos/${repo}/issues/${ISSUE_NUMBER}/semantically_similar?per_page=10&threshold=0.5" \
+              --jq '[.[] | {number, title, state, html_url, labels: [.labels[].name]}]' \
+              > /tmp/issue-triage-context/similar-issues.json; then
+            echo "Fetched semantic duplicate candidates."
+          else
+            echo "[]" > /tmp/issue-triage-context/similar-issues.json
+            echo "::notice::Semantic duplicate lookup was unavailable; continuing with empty candidates."
+          fi
+
+          cp triage/working-areas.md /tmp/issue-triage-context/working-areas.md
+          if [ "$repo" = "$GITHUB_REPOSITORY" ]; then
+            echo "$GITHUB_WORKSPACE" > /tmp/issue-triage-context/target-checkout-path.txt
+          elif gh repo clone "$repo" /tmp/issue-triage-target-repo -- --filter=blob:none; then
+            echo /tmp/issue-triage-target-repo > /tmp/issue-triage-context/target-checkout-path.txt
+          else
+            echo "" > /tmp/issue-triage-context/target-checkout-path.txt
+            echo "::notice::Could not clone ${repo}; continuing without git blame signals."
+          fi
+
+      - name: Install Copilot CLI
+        env:
+          VERSION: prerelease
+        run: curl -fsSL --retry 3 --retry-connrefused https://gh.io/copilot-install | bash
+
+      - name: Run issue triage agent
+        env:
+          GITHUB_TOKEN: ${{ secrets.TRIAGE_BOT_TOKEN || github.token }}
+          REPO_OWNER: ${{ steps.context.outputs.repo_owner }}
+          REPO_NAME: ${{ steps.context.outputs.repo_name }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+        run: |
+          set -uo pipefail
+          copilot --yolo -p "$(cat .github/prompts/issue-triage.md)" \
+            2>&1 | tee /tmp/issue-triage-agent.log
+          rc=${PIPESTATUS[0]}
+          {
+            echo "## Copilot CLI output (last 120 lines)"
+            echo '```'
+            tail -n 120 /tmp/issue-triage-agent.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: Validate triage artifact
+        id: validate
+        run: |
+          set -euo pipefail
+          if [ ! -s /tmp/issue-triage-result.json ]; then
+            echo "has_result=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Copilot did not write /tmp/issue-triage-result.json"
+            exit 1
+          fi
+          node -e '
+            const fs = require("fs");
+            const result = JSON.parse(fs.readFileSync("/tmp/issue-triage-result.json", "utf8"));
+            if (!result.issue || !Number.isInteger(Number(result.issue.number))) throw new Error("missing issue.number");
+            if (!["bug", "feature-request", "question", "feedback"].includes(result.classification)) throw new Error("invalid classification");
+            if (!["high", "medium", "low"].includes(result.confidence)) throw new Error("invalid confidence");
+            if (!result.investigation || !["ask-for-info", "review-duplicate", "assign-owner", "start-session", "manual-review"].includes(result.investigation.next_action)) throw new Error("invalid next_action");
+          '
+          echo "has_result=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload triage artifact
+        if: steps.validate.outputs.has_result == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-triage-result
+          path: |
+            /tmp/issue-triage-result.json
+            /tmp/issue-triage-agent.log
+            /tmp/issue-triage-context/
+          retention-days: 7
+          if-no-files-found: error
+
+  apply:
+    name: Apply triage result
+    needs: generate
+    if: needs.generate.outputs.has_result == 'true' && needs.generate.outputs.should_apply == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download triage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: issue-triage-result
+          path: /tmp/issue-triage-artifact
+
+      - name: Apply labels, comment, and assignee
+        env:
+          GH_TOKEN: ${{ secrets.TRIAGE_BOT_TOKEN || github.token }}
+          TRIAGE_RESULT_PATH: /tmp/issue-triage-artifact/issue-triage-result.json
+        run: node scripts/apply-issue-triage.mjs
