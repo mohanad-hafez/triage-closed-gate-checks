@@ -1,0 +1,47 @@
+name: Issue state
+on:
+  push:
+    branches: [replacement-closed-triage-gate-01]
+    paths: [.github/issue-state-ready]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    if: github.repository == 'mohanad-hafez/triage-closed-gate-checks'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: node --test .github/triage/closed_gate.test.cjs
+      - name: Record issue state
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        with:
+          script: |
+            const fs=require('fs');const assert=require('assert/strict');const {closedIssueGate}=require(process.env.GITHUB_WORKSPACE+'/.github/triage/closed_gate.cjs');
+            assert.equal(context.repo.owner+'/'+context.repo.repo,'mohanad-hafez/triage-closed-gate-checks');
+            const snapshot=x=>({number:x.number,title:x.title,body:x.body,state:x.state,state_reason:x.state_reason,labels:x.labels.map(l=>l.name).sort(),assignees:x.assignees.map(a=>a.login).sort(),comments:x.comments});
+            const target=(await github.rest.issues.get({...context.repo,issue_number:1})).data;
+            const before=snapshot(target),expected={"number":1,"title":"[Bugs] Title: Remote MCP OAuth: works via standalone CLI, but UI is stuck and unacti...","body":"**Mood:** 😔\n**Category:** Bugs\n\nTitle: Remote MCP OAuth: works via standalone CLI, but UI is stuck and unactionable\n\nSummary\nA plugin-declared remote MCP server requiring OAuth starts in needs-auth with no cached token and contributes zero tools. There's no in-UI way to complete auth. Authenticating through a separately installed standalone CLI completes the OAuth flow and the server's tools become available — but the desktop UI never reflects this: it sits on a perpetual loader even after the server is authenticated and working.\n\nFriction points\n\nUI stuck on loader. After auth succeeds (tools do appear to the agent), the UI keeps showing a loading spinner — status never resolves to connected / ready.\nNo in-UI auth path. Completing OAuth is not possible from the app; the actual fix was to install and run a standalone CLI separately to trigger the flow.\nNo agent-facing auth status. A declared-but-unauthenticated server silently has no tools — indistinguishable from not configured or failed.\nDiagnosis requires internals. The only way to learn the true state was grepping runtime logs, probing the keychain, and reading config JSON. Brittle and non-obvious.\nOpaque token cache. Tokens aren't in the keychain or any discoverable file, so success can't be verified from the app.\nNoisy logging. Expected needs-auth states log at [ERROR] alongside genuine failures.\nSuggested improvements\n\nFix the UI to reconcile status once auth completes (poll/subscribe so the loader resolves to connected).\nProvide an in-UI, agent-invocable \"authenticate server X\" action — don't require a separate standalone CLI.\nExpose per-server MCP status (ok / needs-auth / failed) as a queryable surface for the agent.\nDowngrade expected needs-auth from [ERROR] to [WARN]/[INFO].\nWorkaround: Install and run the standalone CLI separately to complete OAuth; the server then works, though the UI loader remains stuck.\n\n---\n| Field | Value |\n| --- | --- |\n| App version | 1.0.12 |\n| OS | macOS 26.5.1 |\n| Theme | GitHub |\n| Path | /chat |\n| Tenure | Day 5 (Week 1) |","state":"closed","state_reason":"completed","labels":[],"assignees":[],"comments":0};
+            assert.deepEqual(before,expected);const decision=closedIssueGate(target);assert.equal(decision.decision,'noop');
+            const report=(await github.rest.issues.get({...context.repo,issue_number:2})).data;
+            assert.equal(report.state,'open');assert.equal(report.title,'[aw] No-Op Runs');assert.equal(report.comments,0);
+            const beforeWrite=(await github.rest.issues.get({...context.repo,issue_number:1})).data;assert.deepEqual(snapshot(beforeWrite),expected);
+            const runUrl='https://github.com/mohanad-hafez/triage-closed-gate-checks/actions/runs/'+context.runId;
+            const body='### Issue state'+String.fromCharCode(10,10)+decision.message+String.fromCharCode(10,10)+'> Generated from [Issue state]('+runUrl+')';
+            const result={status:'report_post_started',decision,target_before:before,report_issue:2,body,model_calls:0,target_writes:0};
+            fs.writeFileSync('triage-state-result.json',JSON.stringify(result,null,2));
+            const posted=(await github.rest.issues.createComment({...context.repo,issue_number:2,body})).data;
+            result.status='report_post_confirmed';result.comment={id:posted.id,url:posted.html_url,body:posted.body};
+            const after=(await github.rest.issues.get({...context.repo,issue_number:1})).data;result.target_after=snapshot(after);assert.deepEqual(result.target_after,before);
+            fs.writeFileSync('triage-state-result.json',JSON.stringify(result,null,2));
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: triage-state-result
+          path: triage-state-result.json
+          retention-days: 14
